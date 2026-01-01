@@ -1,3 +1,5 @@
+from hellaswag import render_example
+from hellaswag import iterate_examples
 import os
 import inspect
 import math
@@ -10,7 +12,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from dataclasses import dataclass
-from minigpt.dataset import DataLoaderLite, ShakespeareDataset
+from minigpt.dataset import DataLoaderLite, DataLoaderEduFineWeb, ShakespeareDataset
 from minigpt.utils import get_device
 
 
@@ -219,118 +221,205 @@ class GPT(nn.Module):
     optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
     return optimizer
 
-tokenizer = tiktoken.get_encoding("gpt2")
-print("Tokenizer loaded successfully.")
 
-ds = ShakespeareDataset("data/shakespeare.txt")
-text = ds.text()
-print(f"Dataset loaded successfully, length: {len(text)} characters.")
-
-device = get_device()
-
-total_batch_size = 2**19 # e.g., 512K tokens per batch
-B = 8 # number of sequences in a batch
-T = 1024 # sequence length
-
-assert total_batch_size % (B * T) == 0, "total_batch_size must be multiple of B * T"
-grad_accum_steps = total_batch_size // (B * T)
-print(f"Using grad_accum_steps: {grad_accum_steps} to achieve total batch size of {total_batch_size} tokens")
-
-train_loader = DataLoaderLite(B=B, T=T, text=text)
-
-torch.set_float32_matmul_precision('medium') # TF32
-
-# model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig.gpt2_small())
-# model.eval()
-model.to(device)
-
-# not supported on python 3.14
-# model = torch.compile(model)
-
-print("Model loaded successfully.")
-
-loss_fn = nn.CrossEntropyLoss()
+def get_most_likely_row(tokens, mask, logits):
+    # evaluate the autoregressive loss at all positions
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
 
 
-max_lr = 6e-4
-min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+def main():
+  start_time = time.time()
 
-def get_lr(it):
-  if it < warmup_steps:
-    return max_lr * (it+1)/warmup_steps
-  if it > max_steps:
-    return min_lr
-  decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-  assert 0 <= decay_ratio <= 1
-  coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-  return min_lr + (coeff * (max_lr - min_lr))
+  tokenizer = tiktoken.get_encoding("gpt2")
+  print("Tokenizer loaded successfully.")
 
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device_type=device)
-for step in range(max_steps):
-    t0 = time.time()
+  # ds = ShakespeareDataset("data/shakespeare.txt")
+  # text = ds.text()
+  # print(f"Dataset loaded successfully, length: {len(text)} characters.")
 
-    optimizer.zero_grad()
+  device = get_device()
 
-    loss_accum = 0.0
-    for _accum in range(grad_accum_steps):
-      x, y = train_loader.next_batch()
-      x, y = x.to(device), y.to(device)
-      # with torch.autocast(device_type=device, dtype=torch.bfloat16):
-      logits = model(x)
-      loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
+  total_batch_size = 2**19 # e.g., 512K tokens per batch
+  B = 8 # number of sequences in a batch
+  T = 1024 # sequence length
 
-      # compensate loss for gradient accumulation, since CrossEntropyLoss does mean reduction
-      loss = loss / grad_accum_steps
-      loss_accum += loss.item()
+  assert total_batch_size % (B * T) == 0, "total_batch_size must be multiple of B * T"
+  grad_accum_steps = total_batch_size // (B * T)
+  print(f"Using grad_accum_steps: {grad_accum_steps} to achieve total batch size of {total_batch_size} tokens")
 
-      loss.backward()
+  # train_loader = DataLoaderLite(B=B, T=T, text=text)
+  train_loader = DataLoaderEduFineWeb(B=B, T=T, process_rank=0, num_processes=1, split='train')
+  val_loader = DataLoaderEduFineWeb(B=B, T=T, process_rank=0, num_processes=1, split='val')
 
-    # clip gradients based on norm to max norm 1.0
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+  torch.set_float32_matmul_precision('medium') # TF32
 
-    # adjust learning rate based on cosine decay schedule
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+  # model = GPT.from_pretrained('gpt2')
+  model = GPT(GPTConfig.gpt2_small())
+  # model.eval()
+  model.to(device)
 
-    optimizer.step()
-    if device == "cuda":
-        torch.cuda.synchronize()
-    t1 = time.time()
-    dt = t1 - t0
-    token_per_sec = train_loader.B * train_loader.T * grad_accum_steps / dt
-    print(f"Step {step+1:4d} | loss: {loss_accum:.6f} | lr: {lr:.6e} | norm {norm:.6f} | dt: {dt * 1000:.3f}ms, tokens/sec: {token_per_sec:.1f}")
+  # not supported on python 3.14
+  # model = torch.compile(model)
 
-# save the model checkpoint
-os.makedirs("checkpoints", exist_ok=True)
-torch.save(model.state_dict(), "gpt2_mingpt_shakespeare.pth")
+  print("Model loaded successfully.")
 
-import sys; sys.exit(0)
+  loss_fn = nn.CrossEntropyLoss()
 
-text = "Once upon a time in a land far, far away,"
+  max_lr = 6e-4
+  min_lr = max_lr * 0.1
+  warmup_steps = 10
+  max_steps = 19703 # about 1 epoch over the EduFineWeb dataset (10B / 0.5M = 20K)
 
-num_seq = 5
-input_ids = tokenizer.encode(text)
-input_ids = torch.tensor(input_ids, device=device).repeat(num_seq, 1)  # Batch size 5
-x = input_ids
+  def get_lr(it):
+    if it < warmup_steps:
+      return max_lr * (it+1)/warmup_steps
+    if it > max_steps:
+      return min_lr
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + (coeff * (max_lr - min_lr))
 
-max_length = 50
-torch.manual_seed(42)
-torch.cuda.manual_seed_all(42)
-while x.size(1) < max_length:
-    with torch.no_grad():
-      logits = model(x)
-      logits = logits[:, -1, :]  # Get logits for the last token
-      probs = torch.softmax(logits, dim=-1)  # Convert to probabilities
-      topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1)  # Top-k sampling
-      next_token = torch.multinomial(topk_probs, num_samples=1)  # Sample from top-k
-      xcol = torch.gather(topk_indices, -1, next_token)  # Map back to original token indices
-      x = torch.cat((x, xcol), dim=1)  # Append to sequence
+  # create the log directory we will write checkpoints to and log to
+  log_dir = "log"
+  os.makedirs(log_dir, exist_ok=True)
+  log_file = os.path.join(log_dir, f"log.txt")
+  with open(log_file, "w") as f: # open for writing to clear the file
+      pass
 
-for i in range(num_seq):
-    tokens = x[i, :max_length].tolist()
-    decoded = tokenizer.decode(tokens)
-    print("> ", decoded)
+  optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device_type=device)
+  for step in range(max_steps):
+      t0 = time.time()
+      last_step = (step == max_steps - 1)
+
+      if step > 0 and step % 250 == 0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+          model.eval()
+          val_loss_accum = 0.0
+          val_loss_steps = 20
+          for _ in range(val_loss_steps):
+              x, y = val_loader.next_batch()
+              x, y = x.to(device), y.to(device)
+              with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                  logits, loss = model(x, y)
+              loss = loss / val_loss_steps
+              val_loss_accum += loss.detach()
+          print(f"Step {step+1:4d} | validation loss: {val_loss_accum.item():.6f}")
+          with open(log_file, "a") as f:
+              f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+              if step > 0 and (step % 5000 == 0 or last_step):
+                  # optionally write model checkpoints
+                  checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                  checkpoint = {
+                      'model': raw_model.state_dict(),
+                      'config': raw_model.config,
+                      'step': step,
+                      'val_loss': val_loss_accum.item()
+                  }
+                  # you might also want to add optimizer.state_dict() and
+                  # rng seeds etc., if you wanted to more exactly resume training
+                  torch.save(checkpoint, checkpoint_path)
+
+      # once in a while evaluate hellaswag
+      if (step % 250 == 0 or last_step):
+          num_correct_norm = 0
+          num_total = 0
+          for i, example in enumerate(iterate_examples("val")):
+              # render the example into tokens and labels
+              _, tokens, mask, label = render_example(example)
+              tokens = tokens.to(device)
+              mask = mask.to(device)
+              # get the logits
+              with torch.no_grad():
+                  with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                      logits = model(tokens)
+                  pred_norm = get_most_likely_row(tokens, mask, logits)
+              num_total += 1
+              num_correct_norm += int(pred_norm == label)
+
+          acc_norm = num_correct_norm / num_total
+          print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+          with open(log_file, "a") as f:
+              f.write(f"{step} hella {acc_norm:.4f}\n")
+
+          # generate some sample sequences from the model
+          text = "Once upon a time in a land far, far away,"
+
+          num_seq = 5
+          input_ids = tokenizer.encode(text)
+          input_ids = torch.tensor(input_ids, device=device).repeat(num_seq, 1)  # Batch size 5
+          x = input_ids
+
+          max_length = 50
+
+          while x.size(1) < max_length:
+              with torch.no_grad():
+                logits = model(x)
+                logits = logits[:, -1, :]  # Get logits for the last token
+                probs = torch.softmax(logits, dim=-1)  # Convert to probabilities
+                topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1)  # Top-k sampling
+                next_token = torch.multinomial(topk_probs, num_samples=1)  # Sample from top-k
+                xcol = torch.gather(topk_indices, -1, next_token)  # Map back to original token indices
+                x = torch.cat((x, xcol), dim=1)  # Append to sequence
+
+          for i in range(num_seq):
+              tokens = x[i, :max_length].tolist()
+              decoded = tokenizer.decode(tokens)
+              print("> ", decoded)
+
+      model.train()
+      optimizer.zero_grad()
+
+      loss_accum = 0.0
+      for _accum in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+          logits = model(x)
+          loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
+
+        # compensate loss for gradient accumulation, since CrossEntropyLoss does mean reduction
+        loss = loss / grad_accum_steps
+        loss_accum += loss.item()
+
+        loss.backward()
+
+      # clip gradients based on norm to max norm 1.0
+      norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+      # adjust learning rate based on cosine decay schedule
+      lr = get_lr(step)
+      for param_group in optimizer.param_groups:
+          param_group['lr'] = lr
+
+      optimizer.step()
+      if device == "cuda":
+          torch.cuda.synchronize()
+      t1 = time.time()
+      dt = t1 - t0
+      token_per_sec = train_loader.B * train_loader.T * grad_accum_steps / dt
+      print(f"Step {step+1:4d} | loss: {loss_accum:.6f} | lr: {lr:.6e} | norm {norm:.6f} | dt: {dt * 1000:.3f}ms, tokens/sec: {token_per_sec:.1f}")
+
+  end_time = time.time()
+  total_time = end_time - start_time
+  print(f"Training completed in {total_time/60:.2f} minutes.")
+
+if __name__ == "__main__":
+  main()
