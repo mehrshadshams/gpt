@@ -283,7 +283,7 @@ def main():
   max_lr = 6e-4
   min_lr = max_lr * 0.1
   warmup_steps = 10
-  max_steps = 19703 # about 1 epoch over the EduFineWeb dataset (10B / 0.5M = 20K)
+  max_steps = 19703 * 2 # about 1 epoch over the EduFineWeb dataset (10B / 0.5M = 20K)
 
   def get_lr(it):
     if it < warmup_steps:
@@ -318,7 +318,8 @@ def main():
               x, y = val_loader.next_batch()
               x, y = x.to(device), y.to(device)
               with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                  logits, loss = model(x, y)
+                  logits = model(x)
+                  loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
               loss = loss / val_loss_steps
               val_loss_accum += loss.detach()
           print(f"Step {step+1:4d} | validation loss: {val_loss_accum.item():.6f}")
@@ -328,8 +329,8 @@ def main():
                   # optionally write model checkpoints
                   checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
                   checkpoint = {
-                      'model': raw_model.state_dict(),
-                      'config': raw_model.config,
+                      'model': model.state_dict(),
+                      'config': model.config,
                       'step': step,
                       'val_loss': val_loss_accum.item()
                   }
@@ -416,6 +417,8 @@ def main():
       dt = t1 - t0
       token_per_sec = train_loader.B * train_loader.T * grad_accum_steps / dt
       print(f"Step {step+1:4d} | loss: {loss_accum:.6f} | lr: {lr:.6e} | norm {norm:.6f} | dt: {dt * 1000:.3f}ms, tokens/sec: {token_per_sec:.1f}")
+      with open(log_file, "a") as f:
+          f.write(f"{step} train {loss_accum:.6f}\n")
 
   end_time = time.time()
   total_time = end_time - start_time
